@@ -1,13 +1,17 @@
 package middleware
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/marklude/flink_go/logger"
+	"github.com/marklude/flink_go/redisDB"
 )
 
 type Location struct {
@@ -15,7 +19,10 @@ type Location struct {
 	Lng float64 `json:"lng"`
 }
 
-var history = make(map[string][]Location)
+var (
+	history = make(map[string][]Location)
+	ctx     = context.Background()
+)
 
 type jsonHistory struct {
 	OrderId string     `json:"order_id"`
@@ -43,12 +50,40 @@ func PostLocation(w http.ResponseWriter, r *http.Request) {
 	newLoc := append(oldLoc, l)
 	history[orderId] = newLoc
 
+	// Get history ttl from env
+	historyTTL := os.Getenv("LOCATION_HISTORY_TTL_SECONDS")
+
+	// Save to redis
+	hisJson, _ := json.Marshal(history[orderId])
+	if historyTTL != "" {
+		ttl, err := strconv.ParseInt(historyTTL, 0, 64)
+		if err != nil {
+			logger.ErrorMessage("Parsing ttl failed", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		err = redisDB.Rds.Set(ctx, orderId, hisJson, time.Duration(ttl)*time.Second).Err()
+		if err != nil {
+			logger.ErrorMessage(fmt.Sprintf("Order:%s not created", orderId), err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		err := redisDB.Rds.Set(ctx, orderId, hisJson, 0).Err()
+		if err != nil {
+			logger.ErrorMessage(fmt.Sprintf("Order:%s not created", orderId), err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Order placed with ID: %s", orderId)
 
 }
 
 func GetLocation(w http.ResponseWriter, r *http.Request) {
+	var locations []Location
 	// Get order id
 	vars := mux.Vars(r)
 	orderId, ok := vars["order_id"]
@@ -61,6 +96,13 @@ func GetLocation(w http.ResponseWriter, r *http.Request) {
 
 	max := r.URL.Query().Get("max")
 	var nHistory []Location
+	// Retrieve order from redis
+	result, _ := redisDB.Rds.Get(ctx, orderId).Result()
+	if result != "" {
+		json.Unmarshal([]byte(result), &locations)
+
+	}
+
 	if max != "" {
 
 		nMax, err := strconv.ParseInt(max, 0, 64)
@@ -72,13 +114,13 @@ func GetLocation(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if nMax > int64(len(history[orderId])) {
-			nHistory = history[orderId]
+			nHistory = locations
 		} else {
-			nHistory = history[orderId][:nMax]
+			nHistory = locations[:nMax]
 		}
 
 	} else {
-		nHistory = history[orderId]
+		nHistory = locations
 	}
 
 	history, err := json.Marshal(jsonHistory{OrderId: orderId, History: nHistory})
@@ -104,8 +146,8 @@ func DeleteLocation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set history to empty array
-	history[orderId] = []Location{}
+	// Remove order history from redis
+	redisDB.Rds.Del(ctx, orderId)
 
 	// Return http status and message
 	w.WriteHeader(http.StatusOK)
